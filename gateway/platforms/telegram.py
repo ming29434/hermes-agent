@@ -2050,28 +2050,85 @@ class TelegramAdapter(BasePlatformAdapter):
         reply chain.  The streaming send loop has its own equivalent
         (PR #3390) at the body of ``send``; this helper applies the
         same retry pattern to the non-streaming control paths.
+
+        Also retries on transient network errors (up to 3 attempts with
+        exponential backoff) so intermittent proxy glitches don't silently
+        drop inline-keyboard messages.
         """
         if not self._bot:
             raise RuntimeError("Not connected")
 
-        message_thread_id = kwargs.get("message_thread_id")
         try:
-            return await self._bot.send_message(**kwargs)
-        except Exception as send_err:
-            if (
-                message_thread_id is not None
-                and self._is_bad_request_error(send_err)
-                and self._is_thread_not_found_error(send_err)
-            ):
-                logger.warning(
-                    "[%s] Thread %s not found for control message, retrying without message_thread_id",
-                    self.name,
-                    message_thread_id,
+            from telegram.error import NetworkError as _NetErr
+        except ImportError:
+            _NetErr = OSError
+
+        try:
+            from telegram.error import BadRequest as _BadReq
+        except ImportError:
+            _BadReq = None
+
+        try:
+            from telegram.error import TimedOut as _TimedOut
+        except (ImportError, AttributeError):
+            _TimedOut = None
+
+        # httpx has its own NetworkError hierarchy (separate from PTB's).
+        # Proxy-layer errors like ConnectError bubble up as raw httpx exceptions
+        # and must be caught explicitly.
+        try:
+            import httpx as _httpx
+            _HttpxNetErr = _httpx.NetworkError
+        except (ImportError, AttributeError):
+            _HttpxNetErr = None
+
+        message_thread_id = kwargs.get("message_thread_id")
+
+        for attempt in range(3):
+            try:
+                return await self._bot.send_message(**kwargs)
+            except Exception as send_err:
+                # Thread not found → retry without thread_id
+                if (
+                    message_thread_id is not None
+                    and self._is_bad_request_error(send_err)
+                    and self._is_thread_not_found_error(send_err)
+                ):
+                    logger.warning(
+                        "[%s] Thread %s not found for control message, retrying without message_thread_id",
+                        self.name,
+                        message_thread_id,
+                    )
+                    kwargs = dict(kwargs)
+                    kwargs.pop("message_thread_id", None)
+                    message_thread_id = None
+                    continue
+
+                # Permanent BadRequest errors — don't retry
+                if _BadReq and isinstance(send_err, _BadReq):
+                    raise
+
+                # _transient returns True for errors worth retrying:
+                # PTB TimedOut, PTB NetworkError, httpx NetworkError.
+                _transient = (
+                    (_TimedOut and isinstance(send_err, _TimedOut))
+                    or isinstance(send_err, _NetErr)
+                    or (_HttpxNetErr and isinstance(send_err, _HttpxNetErr))
                 )
-                retry_kwargs = dict(kwargs)
-                retry_kwargs.pop("message_thread_id", None)
-                return await self._bot.send_message(**retry_kwargs)
-            raise
+
+                if _transient:
+                    if attempt < 2:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "[%s] Transient error on control send (attempt %d/3), retrying in %ds: %s",
+                            self.name, attempt + 1, wait, send_err,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+                    continue
+
+                raise
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
